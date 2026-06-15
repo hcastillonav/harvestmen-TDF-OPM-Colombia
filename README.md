@@ -1,4 +1,5 @@
 # Harvestmen assemblages reveal compositional shifts associated with riparian wetland degradation in a tropical dry forest-oil palm landscape
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.20705739.svg)](https://doi.org/10.5281/zenodo.20705739)
 
 This repository contains the data and analysis code supporting the manuscript:
 
