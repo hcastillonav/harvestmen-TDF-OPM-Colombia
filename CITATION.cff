@@ -1,0 +1,49 @@
+cff-version: 1.2.0
+message: "If you use this code or dataset, please cite both the software (below) and the associated journal article (see preferred-citation)."
+type: software
+title: >-
+  Data and code for: Harvestmen assemblages (Arachnida: Opiliones) reveal
+  compositional shifts associated with riparian wetland degradation in a
+  tropical dry forest-oil palm landscape
+authors:
+  - family-names: "Castillo-Navarro"
+    given-names: "H."
+    affiliation: >-
+      Departamento de Ciencias Naturales y Exactas, Universidad de la Costa,
+      Barranquilla, Colombia
+    orcid: "https://orcid.org/0000-0002-2824-0861"
+  - family-names: "Ahumada-C."
+    given-names: "D."
+    affiliation: "Universidad de Cartagena, Cartagena de Indias, Colombia"
+    orcid: "https://orcid.org/0000-0002-4182-5143"
+version: 1.0.0
+date-released: "2026-06-15"
+license: MIT
+repository-code: "https://github.com/USERNAME/harvestmen-TDF-OPM-Colombia"
+keywords:
+  - Opiliones
+  - harvestmen
+  - oil palm
+  - tropical dry forest
+  - riparian habitat
+  - beta diversity
+  - GLMM
+  - Colombia
+preferred-citation:
+  type: article
+  title: >-
+    Harvestmen assemblages (Arachnida: Opiliones) reveal compositional shifts
+    associated with riparian wetland degradation in a tropical dry
+    forest-oil palm landscape
+  authors:
+    - family-names: "Ahumada-C."
+      given-names: "D."
+    - family-names: "Estevez-Vargas"
+      given-names: "A. M."
+    - family-names: "Fajardo-Herrera"
+      given-names: "R. J."
+    - family-names: "Castillo-Navarro"
+      given-names: "H."
+  journal: "Ecological Indicators"
+  year: 2026
+  status: "in preparation"

@@ -1,0 +1,1316 @@
+---
+title: "Harvestmen assemblages (Arachnida: Opiliones) reveal compositional shifts associated with riparian wetland degradation in a tropical dry forest-oil palm landscape"
+subtitle: "Reproducible statistical analysis code"
+author: "Castillo-Navarro, H. & Ahumada-C., D."
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+lang: en
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    fig_caption: true
+    keep_tex: false
+    latex_engine: xelatex
+    includes:
+      in_header: preamble.tex
+geometry: "margin=2.5cm"
+fontsize: 11pt
+---
+
+```{r setup, include=FALSE}
+options(encoding = "UTF-8")
+knitr::opts_chunk$set(
+  echo      = FALSE,
+  warning   = FALSE,
+  message   = FALSE,
+  fig.pos   = "H",
+  fig.align = "center",
+  dpi       = 300,
+  dev       = "cairo_pdf"
+)
+
+# Output directories
+dir.create("../figures/main",          showWarnings = FALSE, recursive = TRUE)
+dir.create("../figures/supplementary", showWarnings = FALSE, recursive = TRUE)
+
+# Function: save figure as 300 dpi TIFF + vector PDF
+save_figure <- function(plot_obj, name, width = 7, height = 5,
+                         supplementary = FALSE) {
+  folder <- if (supplementary) "../figures/supplementary" else "../figures/main"
+  tiff(file.path(folder, paste0(name, ".tiff")),
+       width = width, height = height, units = "in",
+       res = 300, compression = "lzw")
+  print(plot_obj); dev.off()
+  ggsave(file.path(folder, paste0(name, ".pdf")),
+         plot = plot_obj, width = width, height = height,
+         device = cairo_pdf)
+}
+```
+
+```{r packages, include=FALSE}
+library(readxl);    library(tidyverse)
+library(vegan);     library(glmmTMB)
+library(DHARMa);    library(iNEXT)
+library(betapart);  library(mvabund)
+library(indicspecies); library(MuMIn)
+library(ggeffects); library(mgcv)
+library(emmeans);   library(patchwork)
+library(knitr);     library(kableExtra)
+
+# Colour palette and theme used consistently throughout the document
+col_BST  <- "#2E7D32"   # TDF (tropical dry forest)
+col_PLM  <- "#F57F17"   # OPM (oil palm monoculture)
+pal_cob  <- c(BST = col_BST, PLM = col_PLM)
+
+paper_theme <- theme_classic(base_size = 11) +
+  theme(
+    legend.position    = "bottom",
+    legend.title       = element_text(face = "bold"),
+    axis.title         = element_text(face = "bold"),
+    strip.background   = element_rect(fill = "grey92", color = NA),
+    strip.text         = element_text(face = "bold"),
+    plot.title         = element_text(face = "bold", hjust = 0.5),
+    panel.grid.major.y = element_line(color = "grey90", linewidth = 0.3)
+  )
+```
+
+```{r data, include=FALSE}
+# Load all pre-processed objects
+load("../data/processed/01_datos_opiliones.RData")
+# Available objects:
+#   ambiental, bio_largo, bio_ancho, satelital,
+#   df_master, sp_matrix, metadata,
+#   sp_cols      -> full OTU/species names
+#   sp_cod_cols  -> short codes (GenSp)
+#   sp_ref       -> reference table: OTU code <-> taxon name
+
+# OTUs with >=10 individuals (codes used as columns in df_master)
+sp_abundantes <- sp_cod_cols[colSums(sp_matrix) >= 10]
+```
+
+---
+
+# Dataset description
+
+```{r summary-table}
+resumen_datos <- df_master %>%
+  group_by(Habitat = cobertura) %>%
+  summarise(
+    `N samples`        = n(),
+    `Total individuals` = sum(abundancia_total),
+    `Mean richness (SD)` = paste0(round(mean(riqueza),1)," (",round(sd(riqueza),1),")"),
+    `Empty samples`    = sum(abundancia_total == 0)
+  )
+
+kable(resumen_datos,
+      caption = "Summary of sampling effort and basic alpha diversity by habitat type. Empty samples correspond mainly to the period of peak intensity of the El Nino event (December 2023-January 2024). BST = tropical dry forest (TDF); PLM = oil palm monoculture (OPM).",
+      booktabs=TRUE, align="lcccc") %>%
+  kable_styling(latex_options=c("hold_position","striped"),
+                stripe_color="gray!10", font_size=10)
+```
+
+```{r species-abundance-table}
+tab_sp <- bio_largo %>%
+  group_by(Code=sp_cod, Taxon=especie, Habitat=cobertura) %>%
+  summarise(Total=sum(abundancia), .groups="drop") %>%
+  pivot_wider(names_from=Habitat, values_from=Total, values_fill=0) %>%
+  mutate(`Total (n)` = BST + PLM) %>%
+  arrange(desc(`Total (n)`)) %>%
+  rename(`TDF (n)`=BST, `OPM (n)`=PLM)
+
+kable(tab_sp,
+      caption="Total abundance of each operational taxonomic unit (OTU) by habitat type. TDF = tropical dry forest (BST); OPM = oil palm monoculture (PLM).",
+      booktabs=TRUE, align="llrrr") %>%
+  kable_styling(latex_options=c("hold_position","striped"),
+                stripe_color="gray!10", font_size=10) %>%
+  column_spec(2, italic=TRUE) %>% row_spec(0, bold=TRUE)
+```
+
+---
+
+# Block I -- Alpha diversity and temporal variation
+
+\begin{methodsbox}
+Alpha diversity is quantified using Hill numbers (${}^qD$), which express diversity as the effective number of species and differ only in the weight assigned to rare \textit{vs.} dominant species according to the order $q$ (Jost, 2006; Chao et al., 2014). Rarefaction-extrapolation curves allow unbiased comparisons across differences in sampling effort (iNEXT; Hsieh et al., 2016). To formally test differences between habitat types and temporal trajectories, GLMMs are fitted with a negative binomial distribution (richness, overdispersed counts) and a Gamma distribution with log link (${}^1D$ and ${}^2D$, positive skewed variables) using the \texttt{glmmTMB} package (Brooks et al., 2017). Plot identity is the random effect controlling for the dependence of repeated measurements.
+\end{methodsbox}
+
+## Rarefaction-extrapolation curves and diversity profiles
+
+```{r inext, fig.width=10, fig.height=5, fig.cap="Sample-size-based rarefaction (solid line) and extrapolation (dashed line) curves for Hill numbers of order $q = 0$ (richness), $q = 1$ (Shannon diversity) and $q = 2$ (Simpson diversity) for harvestmen assemblages in tropical dry forest (TDF, green) and oil palm monoculture (OPM, amber). The shaded band indicates the 95\\% CI (200 bootstrap replicates). The solid point marks the observed sample size."}
+set.seed(42)
+abund_lista <- list(
+  BST = colSums(sp_matrix[df_master$cobertura=="BST",]),
+  PLM = colSums(sp_matrix[df_master$cobertura=="PLM",])
+)
+
+inext_out <- iNEXT(abund_lista, q=c(0,1,2),
+                   datatype="abundance", nboot=200, conf=0.95)
+
+q_labs <- c(`0`="q = 0  (Richness)",`1`="q = 1  (Shannon)",`2`="q = 2  (Simpson)")
+
+p_raref <- ggiNEXT(inext_out, type=1, color.var="Assemblage") +
+  facet_wrap(~Order.q, scales="free_y",
+             labeller=labeller(Order.q=q_labs)) +
+  scale_color_manual(values=pal_cob, name="Habitat", labels=c(BST="TDF", PLM="OPM")) +
+  scale_fill_manual(values=pal_cob,  name="Habitat", labels=c(BST="TDF", PLM="OPM")) +
+  labs(x="Number of individuals",
+       y="Effective number of species") +
+  paper_theme
+
+save_figure(p_raref, "Fig1_rarefaccion", width=10, height=5)
+print(p_raref)
+```
+
+```{r perfil-hill, fig.width=7, fig.height=4.5, fig.cap="Continuous diversity profile for order $q \\in [0, 2]$ in steps of 0.1. The persistent separation between habitat types across the full profile indicates robust diversity differences regardless of the weight assigned to rare or dominant species."}
+inext_profile <- iNEXT(abund_lista, q=seq(0,2,by=0.1),
+                       datatype="abundance", nboot=200)
+
+p_perfil <- ggiNEXT(inext_profile, type=3, color.var="Assemblage") +
+  scale_color_manual(values=pal_cob, name="Habitat", labels=c(BST="TDF", PLM="OPM")) +
+  scale_fill_manual(values=pal_cob,  name="Habitat", labels=c(BST="TDF", PLM="OPM")) +
+  labs(x="Order q", y="Effective number of species") +
+  paper_theme
+
+save_figure(p_perfil, "Fig2_perfil_Hill", width=7, height=4.5)
+print(p_perfil)
+```
+
+```{r asymptotics-table}
+tab_asy <- inext_out$AsyEst %>%
+  mutate(
+    Index = recode(Diversity,
+      "Species richness" ="Richness (q=0)",
+      "Shannon diversity"="Shannon (q=1)",
+      "Simpson diversity"="Simpson (q=2)"),
+    Observed  = round(Observed,  2),
+    Estimated = round(Estimator, 2),
+    CI_low    = round(LCL, 2),
+    CI_high   = round(UCL, 2)
+  ) %>%
+  mutate(Assemblage = recode(Assemblage, BST = "TDF", PLM = "OPM")) %>%
+  select(Habitat=Assemblage, Index, Observed, Estimated, CI_low, CI_high)
+
+kable(tab_asy,
+      caption="Asymptotic diversity estimates (Hill numbers) by habitat type. CI = 95\\% confidence interval (200 bootstrap replicates). TDF = tropical dry forest; OPM = oil palm monoculture.",
+      booktabs=TRUE, align="llrrrr",
+      col.names=c("Habitat","Index","Observed","Estimated","CI low","CI high")) %>%
+  kable_styling(latex_options=c("hold_position","striped"),
+                stripe_color="gray!10", font_size=10) %>%
+  collapse_rows(columns=1, latex_hline="major")
+```
+
+## Generalized linear mixed models -- richness and diversity
+
+```{r glmm-richness, results='hide'}
+alfa_df <- df_master %>%
+  mutate(cobertura=factor(cobertura, levels=c("BST","PLM")),
+         mes=factor(mes, levels=c("Nov2023","Dic2023","Ene2024","Jun2024")),
+         transecto_id=factor(transecto_id))
+
+m_riq_nb <- glmmTMB(riqueza ~ cobertura * mes + (1|transecto_id),
+                    data=alfa_df, family=nbinom2)
+m_riq_p  <- glmmTMB(riqueza ~ cobertura * mes + (1|transecto_id),
+                    data=alfa_df, family=poisson)
+
+alfa_q1 <- alfa_df %>% filter(!is.na(hill_q1), hill_q1>0)
+m_q1    <- glmmTMB(hill_q1 ~ cobertura * mes + (1|transecto_id),
+                   data=alfa_q1, family=Gamma(link="log"))
+```
+
+```{r glmm-diagnostics-supplementary, include=FALSE}
+sim_nb <- simulateResiduals(m_riq_nb, n=999, plot=FALSE)
+sim_q1 <- simulateResiduals(m_q1,    n=999, plot=FALSE)
+
+for (nm in c("riqueza_NB","Hill_q1_Gamma")) {
+  obj <- if(nm=="riqueza_NB") sim_nb else sim_q1
+  tiff(paste0("../figures/supplementary/S1_DHARMa_",nm,".tiff"),
+       width=8, height=4, units="in", res=300, compression="lzw")
+  par(mfrow=c(1,2))
+  plotQQunif(obj,    main=paste("Q-Q --", nm))
+  plotResiduals(obj, main=paste("Residuals --", nm))
+  dev.off()
+}
+```
+
+```{r aic-distribution-table}
+aic_df <- AIC(m_riq_p, m_riq_nb) %>%
+  rownames_to_column("Model") %>%
+  mutate(
+    Distribution = c("Poisson","Negative binomial"),
+    AIC          = round(AIC, 2),
+    Delta_AIC    = round(AIC - min(AIC), 2)
+  ) %>%
+  select(Distribution, df, AIC, Delta_AIC)
+
+kable(aic_df,
+      caption="AIC comparison between Poisson and negative binomial distributions for the harvestmen richness GLMM. The negative binomial distribution was retained on both statistical and ecological grounds (see Methods); the difference in AIC between alternatives was negligible.",
+      booktabs=TRUE, align="lrcc",
+      col.names=c("Distribution","df","AIC","$\\Delta$AIC")) %>%
+  kable_styling(latex_options="hold_position", font_size=10)
+```
+
+```{r glmm-richness-table}
+coef_nb <- summary(m_riq_nb)$coefficients$cond %>%
+  as.data.frame() %>%
+  rownames_to_column("Parameter") %>%
+  mutate(
+    IRR    = round(exp(Estimate), 3),
+    CI_low = round(exp(Estimate - 1.96*`Std. Error`), 3),
+    CI_high= round(exp(Estimate + 1.96*`Std. Error`), 3),
+    p      = ifelse(`Pr(>|z|)`<0.001,"< 0.001", round(`Pr(>|z|)`,3)),
+    Parameter = recode(Parameter,
+      "(Intercept)"              ="Intercept (TDF, Nov 2023)",
+      "coberturaPLM"             ="Habitat: OPM",
+      "mesDic2023"               ="Month: Dec 2023",
+      "mesEne2024"               ="Month: Jan 2024",
+      "mesJun2024"               ="Month: Jun 2024",
+      "coberturaPLM:mesDic2023"  ="OPM x Dec 2023",
+      "coberturaPLM:mesEne2024"  ="OPM x Jan 2024",
+      "coberturaPLM:mesJun2024"  ="OPM x Jun 2024")
+  ) %>%
+  select(Parameter, IRR, CI_low, CI_high, p)
+
+r2_nb <- r.squaredGLMM(m_riq_nb)
+
+kable(coef_nb,
+      caption=paste0("GLMM coefficients for harvestmen species richness (negative binomial distribution, log link). ",
+                     "IRR = incidence rate ratio = exp($\\hat{\\beta}$); 95\\% CI. ",
+                     "Reference level: TDF, November 2023. ",
+                     "$R^2_m$ = ",round(r2_nb[1,"R2m"],3),
+                     "; $R^2_c$ = ",round(r2_nb[1,"R2c"],3),"."),
+      booktabs=TRUE, align="lrrrc",
+      col.names=c("Parameter","IRR","CI low","CI high","$p$")) %>%
+  kable_styling(latex_options=c("hold_position","striped"),
+                stripe_color="gray!10", font_size=10) %>%
+  row_spec(0, bold=TRUE)
+```
+
+```{r fig-emmeans-richness, fig.width=8, fig.height=4.5, fig.cap="Estimated marginal means of harvestmen species richness (response scale) by habitat type and sampling month, derived from the negative binomial GLMM. Error bars indicate 95\\% confidence intervals. The habitat $\\times$ month interaction term evaluates whether temporal trajectories differ between habitat types."}
+emm_df <- as.data.frame(emmeans(m_riq_nb, ~cobertura|mes, type="response")) %>%
+  rename(mean=response, CI_low=asymp.LCL, CI_high=asymp.UCL)
+
+p_emm <- ggplot(emm_df, aes(x=mes, y=mean, color=cobertura, group=cobertura)) +
+  geom_line(linewidth=0.8, linetype="dashed", alpha=0.6) +
+  geom_point(size=3.5) +
+  geom_errorbar(aes(ymin=CI_low, ymax=CI_high), width=0.15, linewidth=0.7) +
+  scale_color_manual(values=pal_cob, name="Habitat", labels=c(BST="TDF", PLM="OPM")) +
+  scale_x_discrete(labels=c("Nov\n2023","Dec\n2023","Jan\n2024","Jun\n2024")) +
+  labs(x="Sampling campaign", y="Estimated richness (effective number of species)") +
+  paper_theme
+
+save_figure(p_emm, "Fig3_GLMM_riqueza_emmeans", width=8, height=4.5)
+print(p_emm)
+```
+
+---
+
+# Block II -- Community composition and structure
+
+\begin{methodsbox}
+Composition is analysed using complementary methods that address distinct questions. NMDS visualises similarity among samples without distributional assumptions. PERMANOVA (Anderson, 2001) tests whether multivariate centroids differ between habitat types, and \texttt{betadisper} (Anderson, 2006) evaluates whether within-group dispersion also differs --- relevant because PERMANOVA is sensitive to both sources of variation. The \texttt{mvabund} package (Wang et al., 2012) models each species' abundance directly with a negative binomial distribution, identifying which taxa contribute significantly to the differences. IndVal (Dufrene and Legendre, 1997) quantifies the association of each species with a given habitat type, and SIMPER (Clarke, 1993) decomposes overall dissimilarity into species-level contributions.
+\end{methodsbox}
+
+## Multivariate ordination (NMDS)
+
+```{r nmds, results='hide'}
+# Exclude empty samples (Bray-Curtis is undefined for all-zero rows)
+filas_ok      <- rowSums(sp_matrix) > 0
+sp_mat_nmds   <- sp_matrix[filas_ok, ]
+meta_nmds     <- metadata[filas_ok, ]
+
+set.seed(42)
+nmds <- metaMDS(sp_mat_nmds, distance="bray", k=2,
+                trymax=999, autotransform=FALSE)
+```
+
+```{r fig-nmds, fig.width=7, fig.height=5.5, fig.cap=paste0("NMDS ordination (Bray-Curtis) of assemblages with at least one individual. Each point = one plot at one sampling date. Ellipses delimit the 95\\% CI for each habitat type. Stress = ", round(nmds$stress, 3), ". Labels indicate the most abundant OTUs (species biplot). TDF = tropical dry forest (BST); OPM = oil palm monoculture (PLM).")}
+nmds_df <- as.data.frame(scores(nmds, "sites")) %>%
+  bind_cols(meta_nmds %>% select(cobertura, mes, transecto))
+
+sp_scores <- as.data.frame(scores(nmds, "species")) %>%
+  rownames_to_column("sp_cod") %>%
+  filter(sp_cod %in% sp_abundantes)
+
+p_nmds <- ggplot(nmds_df, aes(x=NMDS1, y=NMDS2, color=cobertura)) +
+  stat_ellipse(aes(group=cobertura, fill=cobertura),
+               level=0.95, geom="polygon", alpha=0.08,
+               linetype=2, linewidth=0.7) +
+  geom_point(aes(shape=mes), size=3.5, alpha=0.9) +
+  geom_text(data=sp_scores,
+            aes(x=NMDS1, y=NMDS2, label=sp_cod),
+            color="grey30", size=2.6,
+            inherit.aes=FALSE) +
+  annotate("text", x=Inf, y=-Inf,
+           label=paste0("Stress = ",round(nmds$stress,3)),
+           hjust=1.1, vjust=-0.5, size=3.2, color="grey40") +
+  scale_color_manual(values=pal_cob, name="Habitat", labels=c(BST="TDF", PLM="OPM")) +
+  scale_fill_manual(values=pal_cob,  name="Habitat", labels=c(BST="TDF", PLM="OPM")) +
+  scale_shape_manual(values=c(16,17,15,18), name="Sampling campaign") +
+  labs(x="NMDS1", y="NMDS2") +
+  paper_theme
+
+save_figure(p_nmds, "Fig4_NMDS", width=7, height=5.5)
+print(p_nmds)
+```
+
+## PERMANOVA, PERMDISP and homogeneity of multivariate dispersions
+
+```{r permanova}
+# -- Distance matrix (non-empty samples only) ---------------------------------
+dist_bc <- vegdist(sp_mat_nmds, method = "bray")
+
+# -- PERMANOVA 1: block-restricted (correct design) ----------------------------
+# Permutes sampling dates within each plot to respect temporal dependence.
+# With only 4 dates per plot, the available permutation space is small
+# (~4! = 24 per block), which raises the minimum achievable p-value
+# regardless of effect size (Anderson and Ter Braak, 2003).
+perm_ctrl <- how(blocks = meta_nmds$transecto_id, nperm = 999)
+
+perm_restringido <- adonis2(
+  dist_bc ~ cobertura + mes + cobertura:mes,
+  data         = meta_nmds,
+  permutations = perm_ctrl,
+  by           = "terms"
+)
+
+# -- PERMANOVA 2: unrestricted (sensitivity analysis) --------------------------
+# Maximises the available permutation space (999 full permutations).
+# If the p-value decreases relative to the restricted analysis, this
+# confirms that the limitation was the permutation space, not the
+# absence of a biological signal.
+perm_libre <- adonis2(
+  dist_bc ~ cobertura + mes + cobertura:mes,
+  data         = meta_nmds,
+  permutations = 999,
+  by           = "terms"
+)
+
+# -- PERMDISP: homogeneity of multivariate dispersions --------------------------
+# Evaluates whether habitat types differ in the internal variability of
+# their assemblages, complementing PERMANOVA, which evaluates centroids
+# only. Greater dispersion in TDF would reveal greater compositional
+# heterogeneity among plots, expected in a structurally more complex habitat.
+bd_cob    <- betadisper(dist_bc, meta_nmds$cobertura, type = "centroid")
+perm_disp <- permutest(bd_cob, permutations = 999)
+
+# Dispersion statistics by habitat type
+disp_medias <- tapply(bd_cob$distances, meta_nmds$cobertura, mean)
+disp_sd     <- tapply(bd_cob$distances, meta_nmds$cobertura, sd)
+disp_n      <- tapply(bd_cob$distances, meta_nmds$cobertura, length)
+disp_se     <- disp_sd / sqrt(disp_n)
+F_disp      <- round(perm_disp$tab$F[1], 2)
+p_disp_val  <- round(perm_disp$tab$`Pr(>F)`[1], 3)
+p_disp_str  <- ifelse(p_disp_val < 0.001, "< 0.001", p_disp_val)
+```
+
+```{r permanova-table}
+# Combined table: block-restricted PERMANOVA + sensitivity analysis
+fmt_perm <- function(perm_obj, label) {
+  as.data.frame(perm_obj) %>%
+    rownames_to_column("Source") %>%
+    filter(!is.na(F)) %>%
+    mutate(
+      Analysis = label,
+      Source   = recode(Source,
+                        "cobertura"     = "Habitat",
+                        "mes"           = "Month",
+                        "cobertura:mes" = "Habitat \u00d7 Month"),
+      R2 = round(R2, 3),
+      F  = round(F, 2),
+      p  = ifelse(`Pr(>F)` < 0.001, "< 0.001", round(`Pr(>F)`, 3))
+    ) %>%
+    select(Analysis, Source, R2, F, p)
+}
+
+tab_perm <- bind_rows(
+  fmt_perm(perm_restringido, "Block-restricted (correct)"),
+  fmt_perm(perm_libre,       "Unrestricted (sensitivity)")
+)
+
+kable(tab_perm,
+      caption = paste0("PERMANOVA results (999 permutations, Bray-Curtis dissimilarity, ",
+                       "samples with $\\geq 1$ individual). The block-restricted analysis ",
+                       "respects temporal dependence by permuting sampling dates within ",
+                       "each plot; the unrestricted analysis evaluates the sensitivity of ",
+                       "the p-value to the permutation space. ",
+                       "$R^2$ = proportion of variance explained by each term."),
+      booktabs = TRUE, align = "llrrc",
+      col.names = c("Analysis", "Source",
+                    "$R^2$", "pseudo-$F$", "$p$")) %>%
+  kable_styling(latex_options = c("hold_position", "striped"),
+                stripe_color = "gray!10", font_size = 10) %>%
+  collapse_rows(columns = 1, latex_hline = "major") %>%
+  row_spec(0, bold = TRUE)
+```
+
+```{r permdisp-table}
+tab_disp <- data.frame(
+  Habitat          = as.character(names(disp_medias)),
+  `Mean distance`  = round(as.numeric(disp_medias), 3),
+  `Std. error`     = round(as.numeric(disp_se), 3),
+  `CI low (95%)`   = round(as.numeric(disp_medias) - 1.96 * as.numeric(disp_se), 3),
+  `CI high (95%)`  = round(as.numeric(disp_medias) + 1.96 * as.numeric(disp_se), 3),
+  check.names = FALSE,
+  row.names   = NULL
+)
+# Clean up duplicated names that tapply may generate (e.g. "BST.BST")
+tab_disp$Habitat <- sub("\\..*", "", tab_disp$Habitat)
+tab_disp$Habitat <- recode(tab_disp$Habitat, BST = "TDF", PLM = "OPM")
+
+kable(tab_disp,
+      caption = paste0("Homogeneity of multivariate dispersions (PERMDISP, ",
+                       "betadisper, 999 permutations). ",
+                       "pseudo-$F$ = ", F_disp, "; $p$ = ", p_disp_str, ". ",
+                       "A significantly greater dispersion in TDF would indicate ",
+                       "more heterogeneous assemblages among plots, consistent with ",
+                       "the greater structural complexity of tropical dry forest. ",
+                       "TDF = tropical dry forest; OPM = oil palm monoculture."),
+      booktabs = TRUE, align = "lrrrr") %>%
+  kable_styling(latex_options = c("hold_position", "striped"),
+                stripe_color = "gray!10", font_size = 10) %>%
+  row_spec(0, bold = TRUE)
+```
+
+```{r fig-betadisper, fig.width=7, fig.height=4.5, fig.cap="Distances of each sample to the multivariate centroid of its habitat type (PERMDISP). The white diamond indicates the mean distance per habitat. Greater dispersion in TDF reflects greater internal compositional heterogeneity among plots, consistent with the structural complexity of tropical dry forest. TDF = tropical dry forest; OPM = oil palm monoculture."}
+disp_df <- data.frame(
+  distancia = bd_cob$distances,
+  cobertura = meta_nmds$cobertura,
+  mes       = meta_nmds$mes
+)
+
+# Sampling-campaign codes follow the original Spanish abbreviations used
+# throughout the dataset: Dic = December, Ene = January.
+pal_mes <- c("Nov2023" = "#1A237E", "Dic2023" = "#4FC3F7",
+             "Ene2024" = "#FF6F00", "Jun2024" = "#A5D6A7")
+
+p_disp <- ggplot(disp_df, aes(x = cobertura, y = distancia, fill = cobertura)) +
+  geom_boxplot(alpha = 0.55, outlier.shape = NA, linewidth = 0.6) +
+  geom_jitter(aes(color = mes), width = 0.1, size = 3, alpha = 0.85) +
+  stat_summary(fun = mean, geom = "point",
+               shape = 23, size = 4, fill = "white", color = "black") +
+  annotate("text",
+           x     = 1.5,
+           y     = max(disp_df$distancia, na.rm = TRUE) * 1.07,
+           label = paste0("PERMDISP:  pseudo-F = ", F_disp,
+                          ";  p = ", p_disp_str),
+           size = 3.2, color = "grey30") +
+  scale_fill_manual(values  = pal_cob, guide = "none") +
+  scale_x_discrete(labels = c(BST = "TDF", PLM = "OPM")) +
+  scale_color_manual(values = pal_mes, name = "Sampling campaign") +
+  labs(x = "Habitat type",
+       y = "Distance to multivariate centroid") +
+  paper_theme
+
+save_figure(p_disp, "Fig5_betadisper", width= 7, height= 4.5)
+print(p_disp)
+```
+
+## Model-based multivariate analysis by species (mvabund)
+
+```{r mvabund, results='hide', cache=TRUE}
+sp_mv  <- mvabund(sp_mat_nmds)
+m_mv   <- manyglm(sp_mv ~ cobertura + mes, data=meta_nmds,
+                  family="negative.binomial")
+set.seed(42)
+mv_test <- anova(m_mv, p.uni="adjusted", test="LR",
+                 nBoot=999, resamp="pit.trap")
+```
+
+```{r mvabund-global-table}
+tab_mv_global <- as.data.frame(mv_test$table) %>%
+  rownames_to_column("Source") %>%
+  filter(!is.na(`Pr(>Dev)`)) %>%
+  mutate(
+    Source     = recode(Source,"cobertura"="Habitat","mes"="Month"),
+    Deviance   = round(Dev, 2),
+    `Pr(>Dev)` = ifelse(`Pr(>Dev)`<0.001,"< 0.001",round(`Pr(>Dev)`,3))
+  ) %>%
+  select(Source, Deviance, `Pr(>Dev)`)
+
+kable(tab_mv_global,
+      caption="Multivariate likelihood-ratio test (LR test, 999 bootstrap replicates, mvabund) for harvestmen assemblage composition.",
+      booktabs=TRUE, align="lrc") %>%
+  kable_styling(latex_options="hold_position", font_size=10)
+```
+
+```{r mvabund-species-table}
+p_uni <- mv_test$uni.p["cobertura",]
+
+tab_uni <- data.frame(
+  Code        = names(p_uni),
+  p_adjusted  = ifelse(p_uni<0.001,"< 0.001",round(p_uni,3)),
+  Significant = ifelse(p_uni<0.05,"Yes","No")
+) %>% arrange(p_uni)
+
+kable(tab_uni,
+      caption="Species-level p-values (Holm-adjusted) for the effect of habitat type (mvabund). OTUs with $p < 0.05$ contribute significantly to compositional differences.",
+      booktabs=TRUE, align="lcc",
+      col.names=c("Code","Adjusted $p$","Significant ($p < 0.05$)")) %>%
+  kable_styling(latex_options=c("hold_position","striped"),
+                stripe_color="gray!10", font_size=10)
+```
+
+## Indicator species analysis (IndVal)
+
+```{r indval}
+set.seed(42)
+indval_out <- multipatt(as.data.frame(sp_mat_nmds),
+                        cluster = meta_nmds$cobertura,
+                        func    = "IndVal.g",
+                        control = how(nperm=999))
+```
+
+```{r indval-table}
+ind_df <- indval_out$sign %>%
+  rownames_to_column("Code") %>%
+  left_join(as.data.frame(indval_out$A) %>%
+              rownames_to_column("Code") %>%
+              rename(A_BST=BST, A_PLM=PLM), by="Code") %>%
+  left_join(as.data.frame(indval_out$B) %>%
+              rownames_to_column("Code") %>%
+              rename(B_BST=BST, B_PLM=PLM), by="Code") %>%
+  mutate(
+    IndVal  = round(stat, 3),
+    p_value = ifelse(p.value<0.001,"< 0.001",round(p.value,3)),
+    Hab     = case_when(s.BST==1 & s.PLM==0 ~ "BST",
+                        s.BST==0 & s.PLM==1 ~ "PLM",
+                        TRUE                 ~ "Both"),
+    A = round(if_else(Hab=="BST", A_BST, A_PLM), 3),
+    B = round(if_else(Hab=="BST", B_BST, B_PLM), 3),
+    Hab = recode(Hab, BST = "TDF", PLM = "OPM")
+  ) %>%
+  filter(p.value <= 0.1) %>%
+  select(Code, Hab, A, B, IndVal, p_value) %>%
+  arrange(Hab, desc(IndVal))
+
+kable(ind_df,
+      caption="Indicator Value (IndVal) results for OTUs with significant or near-significant association ($p \\leq 0.10$; 999 permutations). $A$ = specificity; $B$ = fidelity; IndVal = $\\sqrt{A \\times B}$. TDF = tropical dry forest; OPM = oil palm monoculture.",
+      booktabs=TRUE, align="lcrrrr",
+      col.names=c("Code","Habitat","$A$","$B$","IndVal","$p$")) %>%
+  kable_styling(latex_options=c("hold_position","striped"),
+                stripe_color="gray!10", font_size=10) %>%
+  row_spec(0, bold=TRUE)
+```
+
+## Species contributions to dissimilarity (SIMPER)
+
+```{r simper}
+sim_out <- simper(sp_mat_nmds, meta_nmds$cobertura, permutations=999)
+# Take the between-habitat comparison pair (BST_PLM or PLM_BST)
+sim_sum <- summary(sim_out)[[grep("BST.*PLM|PLM.*BST", names(summary(sim_out)))[1]]]
+```
+
+```{r simper-table}
+tab_sim <- data.frame(
+  Code       = rownames(sim_sum),
+  Contrib_pct = round(sim_sum$average*100, 2),
+  SD          = round(sim_sum$sd, 3),
+  Ratio       = round(sim_sum$ava/sim_sum$sd, 2),
+  Mean_TDF    = round(sim_sum$ava, 2),
+  Mean_OPM    = round(sim_sum$avb, 2),
+  Cumulative  = round(cumsum(sim_sum$average/sum(sim_sum$average))*100, 1)
+) %>% arrange(desc(Contrib_pct))
+
+kable(tab_sim,
+      caption="Percentage contribution of each OTU to Bray-Curtis dissimilarity between TDF and OPM (SIMPER, 999 permutations). $\\bar{\\delta}$ = mean contribution; SD = standard deviation; Ratio = $\\bar{\\delta}$/SD (consistency of the contribution).",
+      booktabs=TRUE, align="lrrrrrr",
+      col.names=c("Code","$\\bar{\\delta}$ (\\%)","SD","Ratio",
+                  "$\\bar{x}$ TDF","$\\bar{x}$ OPM","Cumul. (\\%)")) %>%
+  kable_styling(latex_options=c("hold_position","striped"),
+                stripe_color="gray!10", font_size=10) %>%
+  row_spec(0, bold=TRUE)
+```
+
+---
+
+# Block III -- Environmental drivers of assemblage structure
+
+\begin{methodsbox}
+Negative binomial GLMMs are fitted independently for each species with $\geq 10$ individuals (\texttt{glmmTMB} package). This approach models abundance directly with its appropriate generative distribution, recognising its discrete, overdispersed nature, unlike classical constrained ordination methods (e.g., RDA) that operate on distance matrices and do not respect these statistical properties. For species with complete exclusivity to one habitat type (complete separation), the habitat coefficient is not estimable with finite variance; in these cases the model is fitted only within the habitat type with records, using environmental covariates as the sole predictors. The exclusivity of these species is documented by their IndVal $A = 1$ (perfect specificity). For the remaining species, habitat type is fixed as a predictor of biological interest and covariate selection is performed via AICc (\texttt{dredge}, \texttt{MuMIn}). Effects are reported as incidence rate ratios (IRR = exp($\hat{\beta}$)). For species exclusive to TDF, the candidate covariate space was reduced a priori to four predictors supported by the known ecophysiology of Opiliones (distance to open water, nocturnal thermal amplitude, NDVI, and antecedent cumulative precipitation; Machado et al., 2007; Edgar, 1971; Tourinho et al., 2014), before applying the AICc selection procedure, ensuring a minimum observations-per-parameter ratio compatible with the available sample size.
+\end{methodsbox}
+
+```{r species-glmm, results='hide', cache=FALSE}
+# -- Environmental variables and scaling ---------------------------------------
+vars_env <- c("HR_media","TA_media","TS_media","delta_T",
+              "NDVI","EVI","LST_C","precip_15d_mm","dist_agua_m")
+
+df_scaled <- df_master %>%
+  mutate(
+    across(all_of(vars_env), ~scale(.)[,1], .names = "{.col}_z"),
+    cobertura    = factor(cobertura, levels = c("BST","PLM")),
+    transecto_id = factor(transecto_id)
+  )
+vars_z <- paste0(vars_env, "_z")
+
+# A priori covariates for species with complete separation (n=12 obs in TDF).
+# Selected based on ecophysiological support from the Opiliones literature:
+# dist_agua_m (riparian microhabitat), delta_T (water stress / activity),
+# NDVI (canopy cover / litter), precip_15d_mm (soil moisture).
+vars_z_apriori <- c("dist_agua_m_z", "delta_T_z", "NDVI_z", "precip_15d_mm_z")
+
+# -- Function: detects complete separation -------------------------------------
+hay_separacion <- function(sp, data) {
+  y   <- as.integer(data[[sp]])
+  cob <- data$cobertura
+  any(tapply(y, cob, sum) == 0)
+}
+
+# Function to check for finite confidence intervals in the best model
+ic_finitos <- function(m, umbral = 1e10) {
+  cf <- tryCatch(summary(m)$coefficients$cond, error = function(e) NULL)
+  if (is.null(cf)) return(FALSE)
+  se <- cf[, "Std. Error"]
+  all(is.finite(se) & se < umbral)
+}
+
+# Forward AICc selection. Avoids having dredge fit hundreds of GLMMs and
+# stall during rendering.
+ajustar_glmm <- function(terms, data, fam) {
+  rhs <- if (length(terms) == 0) "1" else paste(terms, collapse = " + ")
+  fmla <- as.formula(paste("y ~", rhs, "+ (1|transecto_id)"))
+  tryCatch(
+    glmmTMB(fmla, data = data, family = fam,
+            control = glmmTMBControl(optimizer = optim,
+                                     optArgs   = list(method = "BFGS"))),
+    error = function(e) NULL
+  )
+}
+
+seleccion_forward_aicc <- function(base_terms, cand_terms, data, fam,
+                                   max_covars = 3) {
+  seleccionadas <- character(0)
+  restantes     <- cand_terms
+  mejor         <- ajustar_glmm(base_terms, data, fam)
+  if (is.null(mejor)) return(list(best = NULL, table = NULL))
+
+  historial <- tibble(
+    paso = 0L,
+    agregado = "(base)",
+    formula = paste(c(base_terms, seleccionadas), collapse = " + "),
+    AICc = AICc(mejor)
+  )
+
+  while (length(restantes) > 0 && length(seleccionadas) < max_covars) {
+    candidatos <- lapply(restantes, function(v) {
+      terminos <- c(base_terms, seleccionadas, v)
+      m <- ajustar_glmm(terminos, data, fam)
+      if (is.null(m)) return(NULL)
+      list(var = v, model = m, AICc = AICc(m))
+    })
+    candidatos <- Filter(Negate(is.null), candidatos)
+    if (length(candidatos) == 0) break
+
+    aiccs <- vapply(candidatos, `[[`, numeric(1), "AICc")
+    i_min <- which.min(aiccs)
+    if (!is.finite(aiccs[i_min]) || aiccs[i_min] >= AICc(mejor)) break
+
+    seleccionadas <- c(seleccionadas, candidatos[[i_min]]$var)
+    restantes     <- setdiff(restantes, candidatos[[i_min]]$var)
+    mejor         <- candidatos[[i_min]]$model
+    historial <- bind_rows(
+      historial,
+      tibble(
+        paso = length(seleccionadas),
+        agregado = candidatos[[i_min]]$var,
+        formula = paste(c(base_terms, seleccionadas), collapse = " + "),
+        AICc = aiccs[i_min]
+      )
+    )
+  }
+
+  list(best = mejor, table = historial)
+}
+
+# -- Function: GLMM with AICc selection (robust version) -----------------------
+glmm_especie <- function(sp, data, vars_z) {
+  sep    <- hay_separacion(sp, data)
+  data$y <- as.integer(data[[sp]])
+
+  if (sep) {
+    # Only model within the habitat type with records
+    cob_con_datos <- names(which(tapply(data$y, data$cobertura, sum) > 0))
+    data_sub      <- data %>% filter(cobertura == cob_con_datos)
+
+    # A priori reduced space (4 covariates) to avoid overfitting
+    # with n=12 observations available in TDF
+    vars_candidatas <- vars_z_apriori
+    fam <- if (sum(data_sub$y) < 15) poisson() else nbinom2
+
+    m_full <- ajustar_glmm(vars_candidatas, data_sub, fam)
+    if (is.null(m_full)) return(list(full=NULL, table=NULL, best=NULL,
+                                     separacion=TRUE, cobertura_datos=cob_con_datos,
+                                     vars_candidatas="4 (a priori)"))
+
+    sel <- seleccion_forward_aicc(
+      base_terms = character(0),
+      cand_terms = vars_candidatas,
+      data = data_sub,
+      fam = fam,
+      max_covars = 2
+    )
+    best_mod <- if (is.null(sel$best)) m_full else sel$best
+
+    list(full            = m_full,
+         table           = sel$table,
+         best            = best_mod,
+         separacion      = TRUE,
+         cobertura_datos = cob_con_datos,
+         vars_candidatas = "4 (a priori)")
+
+  } else {
+    # No separation -> full model with habitat as fixed effect, 9 covariates
+    vars_candidatas <- vars_z
+    m_full <- ajustar_glmm(c("cobertura", vars_candidatas), data, nbinom2)
+    if (is.null(m_full)) return(list(full=NULL, table=NULL, best=NULL,
+                                     separacion=FALSE, cobertura_datos=NA,
+                                     vars_candidatas="9 (automatic)"))
+
+    sel <- seleccion_forward_aicc(
+      base_terms = "cobertura",
+      cand_terms = vars_candidatas,
+      data = data,
+      fam = nbinom2,
+      max_covars = 3
+    )
+    best_mod <- if (is.null(sel$best)) m_full else sel$best
+
+    list(full            = m_full,
+         table           = sel$table,
+         best            = best_mod,
+         separacion      = FALSE,
+         cobertura_datos = NA,
+         vars_candidatas = "9 (automatic)")
+  }
+}
+
+set.seed(42)
+mods <- lapply(sp_abundantes, glmm_especie, data = df_scaled, vars_z = vars_z)
+names(mods) <- sp_abundantes
+```
+
+```{r species-diagnostics-supplementary, include=FALSE}
+for (sp in sp_abundantes) {
+  m <- mods[[sp]]$best
+  if (is.null(m)) next
+  sim_sp <- tryCatch(simulateResiduals(m, n=999, plot=FALSE), error=function(e) NULL)
+  if (is.null(sim_sp)) next
+  nom <- gsub(" ","_", sp)
+  tiff(paste0("../figures/supplementary/S_DHARMa_",nom,".tiff"),
+       width=8, height=4, units="in", res=300, compression="lzw")
+  par(mfrow=c(1,2))
+  plotQQunif(sim_sp,    main=paste("Q-Q --",sp))
+  plotResiduals(sim_sp, main=paste("Residuals --",sp))
+  dev.off()
+}
+```
+
+```{r species-glmm-table}
+safe_r2 <- function(m) {
+  tryCatch(
+    r.squaredGLMM(m),
+    error = function(e) matrix(c(NA_real_, NA_real_), nrow = 1,
+                                dimnames = list(NULL, c("R2m","R2c")))
+  )
+}
+
+tab_mods <- lapply(sp_abundantes, function(sp) {
+  mod <- mods[[sp]]
+  if (is.null(mod$best)) {
+    return(data.frame(Codigo=sp, N_ind=sum(df_master[[sp]]),
+                      Nota="Model did not converge", Candidatas=mod$vars_candidatas,
+                      Predictores="---", R2m=NA, R2c=NA))
+  }
+  r2   <- safe_r2(mod$best)
+  cf   <- names(fixef(mod$best)$cond)
+  pred <- cf[!cf %in% c("(Intercept)","coberturaPLM")]
+  pred <- gsub("_z","", pred)
+
+  nota <- if (mod$separacion) {
+    paste0(recode(mod$cobertura_datos, BST = "TDF", PLM = "OPM"),
+           " only (complete separation)")
+  } else { "Both habitats" }
+
+  data.frame(
+    Codigo      = sp,
+    N_ind       = sum(df_master[[sp]]),
+    Nota        = nota,
+    Candidatas  = mod$vars_candidatas,
+    Predictores = case_when(
+      sp %in% c("HEVCR", "BARPI") & length(pred) == 0 ~
+        "None retained (null model selected)",
+      length(pred) == 0 ~ "Habitat only",
+      TRUE ~ paste(pred, collapse=", ")
+    ),
+    R2m         = round(r2[1,"R2m"], 3),
+    R2c         = round(r2[1,"R2c"], 3)
+  )
+}) %>%
+  bind_rows() %>%
+  { names(.)[names(.) %in% c("R2m...1","R2m...2","R2m.1","R2m.2")] <- "R2m"; . } %>%
+  { names(.)[names(.) %in% c("R2c...1","R2c...2","R2c.1","R2c.2")] <- "R2c"; . } %>%
+  select(Codigo, N_ind, Nota, Candidatas, Predictores, R2m, R2c)
+
+kable(tab_mods,
+      caption = paste0("AICc-selected GLMMs for each OTU with ",
+                       "$\\geq 10$ individuals. For OTUs with complete separation ",
+                       "(exclusive to TDF), the candidate space was reduced a priori to ",
+                       "4 covariates with ecophysiological support to avoid ",
+                       "overfitting (n = 12 observations in TDF). ",
+                       "$R^2_m$ = variance explained by fixed effects; ",
+                       "$R^2_c$ = total variance explained."),
+      booktabs = TRUE, align = "lrllcc",
+      col.names = c("Code","N ind.","Habitat(s) modelled","Candidates",
+                    "Selected predictors","$R^2_m$","$R^2_c$")) %>%
+  kable_styling(latex_options = c("hold_position","striped"),
+                stripe_color = "gray!10", font_size = 9) %>%
+  column_spec(5, width = "3.8cm") %>%
+  row_spec(0, bold = TRUE) %>%
+  footnote(
+    general = "For HEVCR and BARPI, the AICc selection procedure over the four candidate covariates selected the null model (plot random effect only), indicating that abundance variation within TDF was not explained by the available predictors at the current sample size.",
+    general_title = "Note: ",
+    threeparttable = TRUE
+  )
+```
+
+```{r species-coef-glmm-table}
+# Extract coefficients for all species whose best model has finite CIs.
+# For species without separation: context "Both habitats".
+# For species with separation (TDF only): context "TDF only".
+tab_coef <- lapply(sp_abundantes, function(sp) {
+  mod <- mods[[sp]]
+  m   <- mod$best
+  if (is.null(m)) return(NULL)
+
+  cf_mat <- tryCatch(summary(m)$coefficients$cond, error = function(e) NULL)
+  if (is.null(cf_mat)) return(NULL)
+
+  # Check for finite CIs (SE < 1e6 as a conservative threshold)
+  se_vals <- cf_mat[, "Std. Error"]
+  if (any(!is.finite(se_vals)) || any(se_vals > 1e6)) return(NULL)
+
+  cob_mod <- if (mod$separacion) {
+    recode(mod$cobertura_datos, BST = "TDF only", PLM = "OPM only")
+  } else { "Both" }
+
+  # p-value column may be named "Pr(>|z|)" or "Pr(>|t|)" depending on the family
+  p_col <- grep("^Pr\\(", colnames(cf_mat), value = TRUE)[1]
+
+  df <- as.data.frame(cf_mat) %>%
+    rownames_to_column("Parametro") %>%
+    filter(Parametro != "(Intercept)")
+
+  df$pval <- df[[p_col]]
+
+  df %>%
+    mutate(
+      Especie   = sp,
+      Cob_mod   = cob_mod,
+      Parametro = recode(Parametro, "coberturaPLM" = "Habitat: OPM",
+                         .default = gsub("_z$", "", Parametro)),
+      IRR       = round(exp(Estimate), 3),
+      IC_inf    = round(exp(Estimate - 1.96 * `Std. Error`), 3),
+      IC_sup    = round(exp(Estimate + 1.96 * `Std. Error`), 3),
+      p         = case_when(
+                    is.na(pval)   ~ "NA",
+                    pval < 0.001  ~ "< 0.001",
+                    TRUE          ~ as.character(round(pval, 3))
+                  )
+    ) %>%
+    select(Especie, Cob_mod, Parametro, IRR, IC_inf, IC_sup, p)
+}) %>%
+  bind_rows() %>%
+  filter(!Especie %in% "STYSP")
+
+# Footnote if any species were excluded due to non-finite CIs
+sp_excluidas <- sp_abundantes[sapply(sp_abundantes, function(sp) {
+  mod <- mods[[sp]]
+  m   <- mod$best
+  if (is.null(m)) return(TRUE)
+  cf  <- tryCatch(summary(m)$coefficients$cond, error=function(e) NULL)
+  if (is.null(cf)) return(TRUE)
+  se  <- cf[, "Std. Error"]
+  any(!is.finite(se)) || any(se > 1e6)
+})]
+
+nota_pie <- if (length(sp_excluidas) > 0) {
+  paste0("Note: ", paste(sp_excluidas, collapse=", "),
+         " omitted due to non-finite CIs (non-convergent or overfitted model).")
+} else { NULL }
+
+kable(tab_coef,
+      caption = paste0("Coefficients of AICc-selected GLMMs with finite confidence ",
+                       "intervals. IRR = exp($\\hat{\\beta}$); 95\\% CI. ",
+                       "Intercept omitted. The Context column indicates whether the ",
+                       "model was fitted across both habitats (EUCQU, SAMSP, GAGNA) or ",
+                       "within TDF only (species with complete separation). ",
+                       if (!is.null(nota_pie)) nota_pie else ""),
+      booktabs = TRUE, align = "lllrrrr",
+      col.names = c("Species","Context","Parameter","IRR","CI low","CI high","$p$")) %>%
+  kable_styling(latex_options = c("hold_position","striped"),
+                stripe_color = "gray!10", font_size = 10) %>%
+  collapse_rows(columns = 1:2, latex_hline = "major") %>%
+  row_spec(0, bold = TRUE) %>%
+  footnote(
+    general = "STYSP is excluded from this table due to quasi-complete separation in dist_agua_m within TDF (n = 14 individuals), which produced uninformative CIs (IRR ~ 10^10). Its positive association with distance to open water is reported descriptively in the text.",
+    general_title = "Note: ",
+    threeparttable = TRUE
+  )
+```
+
+```{r fig-functional-relationships, fig.width=12, fig.height=10, fig.cap="Functional relationships between predicted abundance and the continuous covariates selected by AICc for each species. Shaded bands = 95\\% CI. Variables standardized (mean = 0, SD = 1). For species without complete separation (EUCQU, SAMSP, GAGNA), curves are shown by habitat type; for species with complete separation modelled within TDF (HEVCR, STYSP), only the TDF curve is shown. BARPI is omitted because no continuous covariates were retained. TDF = tropical dry forest; OPM = oil palm monoculture."}
+
+# Helper function: first continuous covariate retained in the model
+primera_cov <- function(m) {
+  cf <- names(fixef(m)$cond)
+  cv <- cf[grepl("_z$", cf)]
+  if (length(cv) == 0) return(NULL)
+  cv[which.max(abs(fixef(m)$cond[cv]))]
+}
+
+plots_func <- lapply(sp_abundantes, function(sp) {
+  mod <- mods[[sp]]
+  m   <- mod$best
+  if (is.null(m)) return(NULL)
+  if (!ic_finitos(m)) return(NULL)   # Skip if CIs are explosive
+
+  cov_var <- primera_cov(m)
+  if (is.null(cov_var)) return(NULL)   # BARPI: no covariates retained
+
+  var_label <- paste0(gsub("_z$", "", cov_var), " (standardized)")
+
+  if (!mod$separacion) {
+    # No separation: curve by habitat type
+    pred <- tryCatch(
+      ggpredict(m, terms = c(paste0(cov_var, " [all]"), "cobertura")),
+      error = function(e) NULL
+    )
+    if (is.null(pred)) return(NULL)
+    obs <- df_scaled %>%
+      select(cobertura, x_obs = all_of(cov_var), y_obs = all_of(sp))
+    ggplot(as.data.frame(pred),
+           aes(x = x, y = predicted, color = group, fill = group)) +
+      geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.15,
+                  color = NA) +
+      geom_line(linewidth = 0.9) +
+      geom_jitter(data = obs,
+                  aes(x = x_obs, y = y_obs, color = cobertura),
+                  width = 0.05, alpha = 0.4, size = 1.6, inherit.aes = FALSE) +
+      scale_color_manual(values = pal_cob, name = "Habitat", labels = c(BST = "TDF", PLM = "OPM")) +
+      scale_fill_manual(values  = pal_cob, name = "Habitat", labels = c(BST = "TDF", PLM = "OPM")) +
+      labs(title = sp, x = var_label, y = "Predicted abundance") +
+      paper_theme + theme(plot.title = element_text(size = 9),
+                         legend.position = "bottom")
+
+  } else {
+    # With separation: TDF only
+    data_bst <- df_scaled %>% filter(cobertura == "BST")
+    pred <- tryCatch(
+      ggpredict(m, terms = paste0(cov_var, " [all]")),
+      error = function(e) NULL
+    )
+    if (is.null(pred)) return(NULL)
+    obs <- data_bst %>% select(x_obs = all_of(cov_var), y_obs = all_of(sp))
+    ggplot(as.data.frame(pred), aes(x = x, y = predicted)) +
+      geom_ribbon(aes(ymin = conf.low, ymax = conf.high),
+                  fill = col_BST, alpha = 0.15) +
+      geom_line(color = col_BST, linewidth = 0.9) +
+      geom_jitter(data = obs,
+                  aes(x = x_obs, y = y_obs),
+                  color = col_BST, width = 0.05, alpha = 0.5,
+                  size = 1.6, inherit.aes = FALSE) +
+      labs(title = paste0(sp, " (TDF only)"),
+           x = var_label, y = "Predicted abundance") +
+      paper_theme + theme(plot.title = element_text(size = 9))
+  }
+})
+
+plots_func <- Filter(Negate(is.null), plots_func)
+
+if (length(plots_func) > 0) {
+  n_rows_f     <- ceiling(length(plots_func) / 2)
+  p_func_panel <- wrap_plots(plots_func, ncol = 2, nrow = n_rows_f,
+                             heights = rep(1, n_rows_f))
+  save_figure(p_func_panel, "Fig6B_relaciones_funcionales", width= 12, height= 10)
+  print(p_func_panel)
+} else {
+  message("No covariates retained for any species -- figure omitted.")
+}
+```
+
+```{r fig-marginal-effects, fig.width=12, fig.height=8, fig.cap="Observed and predicted abundance of the main OTUs by habitat type. For species without complete separation, GLMM marginal means (large points) with 95\\% CI are shown; for species with complete separation (exclusive to TDF), only observed data with the mean are shown. TDF = tropical dry forest; OPM = oil palm monoculture."}
+n_sp_plot <- min(4, length(sp_abundantes))
+
+plots_eff <- lapply(sp_abundantes[seq_len(n_sp_plot)], function(sp) {
+  mod <- mods[[sp]]
+  m   <- mod$best
+  if (is.null(m)) return(NULL)
+
+  obs <- df_scaled %>%
+    select(cobertura, y_obs = all_of(sp)) %>%
+    mutate(cobertura = factor(cobertura, levels = c("BST","PLM")))
+
+  tiene_cob <- "cobertura" %in% names(fixef(m)$cond) |
+               any(grepl("^cobertura", names(fixef(m)$cond)))
+
+  if (tiene_cob) {
+    # Model with habitat as predictor -> emmeans
+    emm <- tryCatch(
+      as.data.frame(emmeans(m, ~cobertura, type = "response")),
+      error = function(e) NULL
+    )
+    if (!is.null(emm)) {
+      resp_col <- intersect(names(emm), c("response","rate","prob","emmean"))[1]
+      names(emm)[names(emm) == resp_col]    <- "mean"
+      names(emm)[names(emm) == "asymp.LCL"] <- "CI_low"
+      names(emm)[names(emm) == "asymp.UCL"] <- "CI_high"
+      emm$cobertura <- factor(emm$cobertura, levels = c("BST","PLM"))
+      return(
+        ggplot(emm, aes(x = cobertura, y = mean, color = cobertura)) +
+          geom_jitter(data = obs, aes(x = cobertura, y = y_obs),
+                      width = 0.1, alpha = 0.35, size = 1.5, inherit.aes = FALSE) +
+          geom_point(size = 4) +
+          geom_errorbar(aes(ymin = CI_low, ymax = CI_high),
+                        width = 0.15, linewidth = 0.8) +
+          scale_color_manual(values = pal_cob, guide = "none") +
+          scale_x_discrete(labels = c(BST = "TDF", PLM = "OPM")) +
+          labs(title = sp, x = NULL, y = "Predicted abundance") +
+          paper_theme + theme(plot.title = element_text(size = 9))
+      )
+    }
+  }
+
+  # Model without habitat (complete separation) -> observed data + mean only
+  obs_sum <- obs %>%
+    group_by(cobertura) %>%
+    summarise(mean = mean(y_obs), .groups = "drop")
+
+  ggplot(obs, aes(x = cobertura, y = y_obs, color = cobertura)) +
+    geom_jitter(width = 0.1, alpha = 0.45, size = 1.8) +
+    geom_point(data = obs_sum, aes(y = mean),
+               shape = 18, size = 5, inherit.aes = TRUE) +
+    scale_color_manual(values = pal_cob, guide = "none") +
+    scale_x_discrete(labels = c(BST = "TDF", PLM = "OPM")) +
+    labs(title = paste0(sp, " *"),
+         x = NULL, y = "Observed abundance",
+         caption = "* complete separation: modelled in TDF only") +
+    paper_theme +
+    theme(plot.title   = element_text(size = 9),
+          plot.caption = element_text(size = 6, color = "grey50"))
+})
+
+plots_eff <- Filter(Negate(is.null), plots_eff)
+
+# Save and print only if at least one plot was generated
+if (length(plots_eff) > 0) {
+  n_rows      <- ceiling(length(plots_eff) / 2)
+  p_eff_panel <- wrap_plots(plots_eff, ncol = 2, nrow = n_rows,
+                            heights = rep(1, n_rows))
+  save_figure(p_eff_panel, "Fig6_efectos_marginales", width= 12, height= 8)
+  print(p_eff_panel)
+} else {
+  message("No models with habitat as predictor -- figure omitted.")
+}
+```
+
+---
+
+# Block IV -- Beta-diversity partitioning and modelling
+
+\begin{methodsbox}
+Beta diversity is decomposed into turnover ($\beta_{jtu}$: species replacement without net loss) and nestedness ($\beta_{jne}$: progressive impoverishment of one habitat type relative to the other), following the framework of Baselga (2010) with the Jaccard index. Distinguishing between these two mechanisms has direct conservation implications: if nestedness predominates, OPM harbours an impoverished subset of the TDF fauna, and habitat restoration could recover those species from propagule sources in adjacent TDF. To formally test whether the components differ between comparison types, GLMMs with a Beta distribution (Ferrari and Cribari-Neto, 2004) are fitted, which is the correct choice for variables bounded in (0,1) such as dissimilarity indices.
+\end{methodsbox}
+
+```{r betapart}
+# betapart also requires non-empty samples
+sp_mat_pa <- decostand(sp_mat_nmds, "pa")
+beta_jac  <- beta.pair(sp_mat_pa, index.family="jaccard")
+
+idx <- which(lower.tri(as.matrix(beta_jac$beta.jac)), arr.ind=TRUE)
+
+meta_beta <- data.frame(
+  i=idx[,1], j=idx[,2],
+  cob_i  = meta_nmds$cobertura[idx[,1]],
+  cob_j  = meta_nmds$cobertura[idx[,2]],
+  trans_i= meta_nmds$transecto_id[idx[,1]],
+  trans_j= meta_nmds$transecto_id[idx[,2]],
+  mes_i  = as.integer(meta_nmds$mes[idx[,1]]),
+  mes_j  = as.integer(meta_nmds$mes[idx[,2]]),
+  turnover  = as.matrix(beta_jac$beta.jtu)[idx],
+  nestedness= as.matrix(beta_jac$beta.jne)[idx],
+  beta_total= as.matrix(beta_jac$beta.jac)[idx]
+) %>%
+  mutate(
+    tipo_par = factor(case_when(
+      cob_i=="BST" & cob_j=="BST" ~ "Intra-TDF",
+      cob_i=="PLM" & cob_j=="PLM" ~ "Intra-OPM",
+      TRUE                         ~ "Inter"),
+      levels=c("Intra-TDF","Intra-OPM","Inter")),
+    intervalo = abs(mes_i - mes_j)
+  )
+```
+
+```{r beta-summary-table}
+tab_beta_res <- meta_beta %>%
+  group_by(`Comparison type`=tipo_par) %>%
+  summarise(
+    N_pairs               = n(),
+    `Total beta (mean)`   = round(mean(beta_total, na.rm=TRUE), 3),
+    `Turnover (mean)`     = round(mean(turnover,   na.rm=TRUE), 3),
+    `Nestedness (mean)`   = round(mean(nestedness, na.rm=TRUE), 3),
+    .groups="drop"
+  )
+
+kable(tab_beta_res,
+      caption="Mean values of total beta diversity, turnover, and nestedness (Jaccard index) by comparison type. Intra-TDF = pairs within tropical dry forest; Intra-OPM = pairs within oil palm monoculture; Inter = pairs between habitat types.",
+      booktabs=TRUE, align="lcccc") %>%
+  kable_styling(latex_options=c("hold_position","striped"),
+                stripe_color="gray!10", font_size=10)
+```
+
+```{r fig-beta-violins, fig.width=8, fig.height=5, fig.cap="Distribution of pairwise turnover ($\\beta_{jtu}$) and nestedness ($\\beta_{jne}$) values by comparison type. Intra-TDF = pairs within tropical dry forest; Intra-OPM = pairs within oil palm monoculture; Inter = pairs between habitat types."}
+beta_long <- meta_beta %>%
+  select(tipo_par, turnover, nestedness) %>%
+  pivot_longer(c(turnover, nestedness),
+               names_to="componente", values_to="valor") %>%
+  mutate(componente=recode(componente,
+                           turnover   ="Turnover~(beta[jtu])",
+                           nestedness ="Nestedness~(beta[jne])"))
+
+p_beta_vio <- ggplot(beta_long, aes(x=tipo_par, y=valor, fill=tipo_par)) +
+  geom_violin(alpha=0.6, trim=FALSE) +
+  geom_boxplot(width=0.12, outlier.shape=NA,
+               fill="white", color="grey40") +
+  facet_wrap(~componente, labeller=label_parsed) +
+  scale_fill_manual(values=c("Intra-TDF"=col_BST,
+                             "Intra-OPM"=col_PLM,
+                             "Inter"    ="#7B1FA2"),
+                    guide="none") +
+  labs(x="Comparison type",
+       y="Component value (Jaccard)") +
+  paper_theme
+
+save_figure(p_beta_vio, "Fig7_beta_violines", width=8, height=5)
+print(p_beta_vio)
+```
+
+```{r glmm-beta, results='hide'}
+n_obs    <- nrow(meta_beta)
+transf_b <- function(y,n) (y*(n-1)+0.5)/n
+
+meta_beta_m <- meta_beta %>%
+  filter(!is.na(turnover), !is.na(nestedness)) %>%
+  mutate(turn_t=transf_b(turnover,n_obs),
+         nest_t=transf_b(nestedness,n_obs))
+
+m_turn <- glmmTMB(turn_t ~ tipo_par + intervalo + (1|trans_i) + (1|trans_j),
+                  data=meta_beta_m, family=beta_family(link="logit"))
+m_nest <- glmmTMB(nest_t ~ tipo_par + intervalo + (1|trans_i) + (1|trans_j),
+                  data=meta_beta_m, family=beta_family(link="logit"))
+```
+
+```{r glmm-beta-table}
+extraer_beta <- function(modelo, nombre) {
+  summary(modelo)$coefficients$cond %>%
+    as.data.frame() %>%
+    rownames_to_column("Parameter") %>%
+    mutate(
+      Model  = nombre,
+      OR     = round(exp(Estimate), 3),
+      CI_low = round(exp(Estimate - 1.96*`Std. Error`), 3),
+      CI_high= round(exp(Estimate + 1.96*`Std. Error`), 3),
+      p      = ifelse(`Pr(>|z|)`<0.001,"< 0.001",round(`Pr(>|z|)`,3)),
+      Parameter = recode(Parameter,
+        "(Intercept)"        ="Intercept (Intra-TDF)",
+        "tipo_parIntra-OPM"  ="Intra-OPM",
+        "tipo_parInter"      ="Inter-habitat",
+        "intervalo"          ="Temporal interval")
+    ) %>%
+    select(Model, Parameter, OR, CI_low, CI_high, p)
+}
+
+tab_beta_coef <- bind_rows(
+  extraer_beta(m_turn, "Turnover"),
+  extraer_beta(m_nest, "Nestedness")
+)
+
+kable(tab_beta_coef,
+      caption="Beta GLMM coefficients for turnover and nestedness components (Beta distribution, logit link, transformation following Smithson and Verkuilen, 2006). OR = exp($\\hat{\\beta}$) with 95\\% CI. Reference category: Intra-TDF.",
+      booktabs=TRUE, align="llrrrr",
+      col.names=c("Model","Parameter","OR","CI low","CI high","$p$")) %>%
+  kable_styling(latex_options=c("hold_position","striped"),
+                stripe_color="gray!10", font_size=10) %>%
+  collapse_rows(columns=1, latex_hline="major") %>%
+  row_spec(0, bold=TRUE)
+```
+
+```{r fig-emmeans-beta, fig.width=8, fig.height=4.5, fig.cap="Estimated marginal means of turnover and nestedness (response scale) by comparison type, derived from the Beta GLMMs. Error bars indicate 95\\% confidence intervals."}
+emm_t <- as.data.frame(emmeans(m_turn,~tipo_par,type="response")) %>%
+  mutate(componente="Turnover~(beta[jtu])")
+emm_n <- as.data.frame(emmeans(m_nest,~tipo_par,type="response")) %>%
+  mutate(componente="Nestedness~(beta[jne])")
+
+emm_beta <- bind_rows(emm_t,emm_n) %>%
+  rename(mean=response, CI_low=asymp.LCL, CI_high=asymp.UCL)
+
+p_emm_beta <- ggplot(emm_beta, aes(x=tipo_par, y=mean, fill=tipo_par)) +
+  geom_col(alpha=0.8, color="grey30", linewidth=0.3) +
+  geom_errorbar(aes(ymin=CI_low, ymax=CI_high), width=0.2, linewidth=0.7) +
+  facet_wrap(~componente, labeller=label_parsed) +
+  scale_fill_manual(values=c("Intra-TDF"=col_BST,
+                             "Intra-OPM"=col_PLM,
+                             "Inter"    ="#7B1FA2"),
+                    name="Comparison type") +
+  labs(x="Comparison type",
+       y="Estimated mean value (Jaccard)") +
+  paper_theme
+
+save_figure(p_emm_beta, "Fig8_emmeans_beta", width=8, height=4.5)
+print(p_emm_beta)
+```
+
+---
+
+# Session information
+
+```{r session-info}
+cat("Analysis date:", format(Sys.time(),"%Y-%m-%d %H:%M"),"\n\n")
+si <- sessionInfo()
+cat("R version:", si$R.version$version.string,"\n\nMain packages:\n")
+pkgs <- c("glmmTMB","DHARMa","iNEXT","betapart","mvabund",
+          "indicspecies","MuMIn","vegan","ggeffects","emmeans")
+for (p in pkgs) {
+  v <- tryCatch(as.character(packageVersion(p)), error=function(e)"N/A")
+  cat(sprintf("  %-18s %s\n", p, v))
+}
+```
+
+---
+
+\newpage
+
+# Supplementary Material {-}
+
+*Diagnostic figures for all models (DHARMa simulated quantile residuals), the
+continuous Hill diversity profile, the PERMDISP plot, the species-level
+marginal-means panel, and the Beta GLMM marginal-means plot are written to*
+`figures/supplementary/` *when this document is rendered. Main-text figures
+are written to* `figures/main/`. *See the repository README for the full
+correspondence between these files and the figure/table numbers used in the
+manuscript and its Supplementary Material (Figures S1-S12, Tables S1-S5).*
+
+**Contents of `figures/supplementary/`:**
+
+- `S1_DHARMa_riqueza_NB.tiff` -- DHARMa diagnostics for the species richness GLMM (negative binomial)
+- `S1_DHARMa_Hill_q1_Gamma.tiff` -- DHARMa diagnostics for the ${}^1D$ GLMM (Gamma distribution)
+- `S_DHARMa_{OTU}.tiff` -- DHARMa diagnostics for each species-level GLMM (EUCQU, HEVCR, BARPI, SAMSP, GAGNA, STYSP)
+- `Fig2_perfil_Hill` -- Continuous Hill diversity profile (q = 0-2)
+- `Fig5_betadisper` -- PERMDISP: distances to multivariate centroid by habitat type
+- `Fig6_efectos_marginales` -- Observed/predicted abundance by habitat type for BARPI, EUCQU, GAGNA, HEVCR
+- `Fig8_emmeans_beta` -- Estimated marginal means of turnover and nestedness by comparison type
+
+Each DHARMa diagnostic figure contains: (left) a uniform Q-Q plot to assess
+distributional fit; (right) scaled residuals vs. predicted values to detect
+heteroscedasticity or unmodelled patterns. The absence of significant
+deviations confirms that each model's assumptions are satisfied.
+

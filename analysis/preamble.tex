@@ -1,0 +1,21 @@
+% Preamble for opiliones_analysis.Rmd
+% Defines the "methodsbox" environment used to highlight short
+% statistical-methods summaries at the start of each analytical block.
+
+\usepackage[most]{tcolorbox}
+
+\newtcolorbox{methodsbox}{
+  enhanced,
+  breakable,
+  colback   = blue!4!white,
+  colframe  = blue!40!black,
+  boxrule   = 0.6pt,
+  arc       = 2pt,
+  left      = 6pt,
+  right     = 6pt,
+  top       = 4pt,
+  bottom    = 4pt,
+  before skip = 8pt,
+  after skip  = 8pt,
+  fontupper = \small
+}
