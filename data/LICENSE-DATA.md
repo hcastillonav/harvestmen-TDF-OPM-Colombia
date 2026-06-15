@@ -23,7 +23,7 @@ Castillo-Navarro, H., Ahumada-C., D., Estevez-Vargas, A. M., Fajardo-Herrera, R.
 (2026). Data and code for: Harvestmen assemblages (Arachnida: Opiliones) reveal
 compositional shifts associated with riparian wetland degradation in a tropical
 dry forest-oil palm landscape [Data set]. Zenodo.
-[https://doi.org/10.5281/zenodo.XXXXXXX](https://doi.org/10.5281/zenodo.20705740)
+https://doi.org/10.5281/zenodo.20705740
 
 ## Data collection acknowledgement
 
